@@ -1,0 +1,84 @@
+#!/bin/bash
+# 一键智能 BBR + 本地 DNS 优化（自动检测资源+测速）
+
+set -e
+
+# 0. 安装必备工具
+apt update -y
+apt install -y unbound libpython3.11 dns-root-data speedtest-cli curl
+
+# 1. 检测 CPU/内存
+CPU=$(nproc)
+MEM=$(free -m | awk '/Mem:/ {print $2}')
+
+# 2. 测速获取网络带宽（Mbps）
+BW=$(speedtest-cli --simple | awk '/Download:/ {print int($2)}')
+echo "检测带宽: ${BW}Mbps"
+
+# 3. 配置 BBR
+if [ "$MEM" -le 2048 ]; then
+    RMEM_WMEM=16777216
+elif [ "$MEM" -le 8192 ]; then
+    RMEM_WMEM=33554432
+else
+    RMEM_WMEM=67108864
+fi
+
+cat <<EOF > /etc/sysctl.d/99-bbr.conf
+net.core.rmem_max = $RMEM_WMEM
+net.core.wmem_max = $RMEM_WMEM
+net.ipv4.tcp_rmem = 4096 87380 $RMEM_WMEM
+net.ipv4.tcp_wmem = 4096 87380 $RMEM_WMEM
+net.ipv4.tcp_congestion_control = bbr
+net.core.default_qdisc = fq
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+EOF
+
+sysctl --system
+
+# 4. 配置本地 DNS
+systemctl stop systemd-resolved || true
+systemctl disable systemd-resolved || true
+echo "nameserver 127.0.0.1" > /etc/resolv.conf
+
+# 根据内存设置缓存
+if [ "$MEM" -le 2048 ]; then
+    CACHE=20000
+elif [ "$MEM" -le 8192 ]; then
+    CACHE=50000
+else
+    CACHE=100000
+fi
+
+cat <<EOF > /etc/unbound/unbound.conf
+server:
+    verbosity: 1
+    interface: 0.0.0.0
+    access-control: 0.0.0.0/0 allow
+    num-threads: $CPU
+    msg-cache-size: ${CACHE}k
+    rrset-cache-size: ${CACHE}k
+    cache-max-ttl: 86400
+    cache-min-ttl: 3600
+    prefetch: yes
+    hide-identity: yes
+    hide-version: yes
+    use-caps-for-id: yes
+EOF
+
+unbound-checkconf
+systemctl restart unbound
+systemctl enable unbound
+
+# 5. 测试 DNS 延迟
+echo "=== DNS 延迟测试 ==="
+for host in 1.1.1.1 8.8.8.8 www.baidu.com; do
+    ping -c 3 $host | tail -1
+done
+
+echo "=== 优化完成 ==="
+echo "CPU: $CPU cores, Memory: ${MEM}MB"
+echo "TCP rmem/wmem max: $RMEM_WMEM"
+echo "DNS cache: ${CACHE}k"
+echo "带宽: ${BW} Mbps"
