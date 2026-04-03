@@ -2,78 +2,81 @@
 
 echo "🚀 开始智能网络调优..."
 
-# ========= 检测工具 =========
-if ! command -v curl &> /dev/null; then
-    apt update && apt install -y curl
+# ========= Root检测 =========
+if [ "$EUID" -ne 0 ]; then
+  echo "❌ 请使用 root 运行"
+  exit 1
 fi
 
-if ! command -v ping &> /dev/null; then
-    apt install -y iputils-ping
-fi
+# ========= 修复DNS（防炸） =========
+echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf
 
-# ========= 安装测速工具 =========
-if ! command -v speedtest &> /dev/null; then
-    echo "📦 安装 speedtest..."
-    apt install -y speedtest-cli || apt install -y speedtest
+# ========= 基础工具 =========
+apt update -y
+apt install -y curl wget bc iputils-ping
+
+# ========= speedtest =========
+if ! command -v speedtest-cli &> /dev/null; then
+    echo "📦 安装 speedtest-cli..."
+    apt install -y speedtest-cli
 fi
 
 # ========= 获取带宽 =========
 echo "📊 测试带宽中..."
 speed=$(speedtest-cli --simple 2>/dev/null | grep Download | awk '{print $2}')
-
-if [ -z "$speed" ]; then
-    echo "⚠️ speedtest失败，默认100Mbps"
-    speed=100
-fi
+[ -z "$speed" ] && speed=100
 
 echo "👉 当前带宽: ${speed} Mbps"
 
 # ========= 获取延迟 =========
 echo "📡 测试延迟中..."
 rtt=$(ping -c 4 8.8.8.8 | tail -1 | awk -F '/' '{print $5}')
-
-if [ -z "$rtt" ]; then
-    rtt=50
-fi
+[ -z "$rtt" ] && rtt=50
 
 echo "👉 当前延迟: ${rtt} ms"
 
 # ========= 计算缓冲 =========
 if (( $(echo "$speed < 100" | bc -l) )); then
-    buffer=16777216   # 16MB
+    buffer=16777216
 elif (( $(echo "$speed < 500" | bc -l) )); then
-    buffer=33554432   # 32MB
+    buffer=33554432
 else
-    buffer=67108864   # 64MB
+    buffer=67108864
 fi
 
 echo "👉 使用缓冲区: $buffer"
 
-# ========= 判断是否高并发（机场） =========
+# ========= 并发优化 =========
 conntrack=262144
-
 if (( $(echo "$speed > 200" | bc -l) )); then
     conntrack=1048576
 fi
 
+echo "👉 conntrack: $conntrack"
+
+# ========= 加载模块 =========
+modprobe nf_conntrack 2>/dev/null
+echo "nf_conntrack" >> /etc/modules 2>/dev/null
+
+# ========= 删除冲突 =========
+rm -f /etc/sysctl.d/99-bbr.conf
+
 # ========= 写入配置 =========
 cat > /etc/sysctl.d/99-auto-tune.conf <<EOF
-# BBR
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 
-# Buffer
 net.core.rmem_max=$buffer
 net.core.wmem_max=$buffer
 net.ipv4.tcp_rmem=4096 87380 $buffer
 net.ipv4.tcp_wmem=4096 87380 $buffer
 
-# Performance
 net.ipv4.tcp_fastopen=3
 net.ipv4.tcp_mtu_probing=1
 net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_fin_timeout=15
+net.ipv4.tcp_keepalive_time=300
 
-# High concurrency (机场优化)
 net.netfilter.nf_conntrack_max=$conntrack
 net.ipv4.ip_local_port_range=1024 65535
 net.core.somaxconn=65535
@@ -83,9 +86,15 @@ EOF
 # ========= 应用 =========
 sysctl --system
 
-# ========= 验证 =========
+# ========= 锁DNS =========
+chattr +i /etc/resolv.conf
+
+# ========= 输出 =========
 echo ""
-echo "✅ 调优完成！"
+echo "========== ✅ 调优完成 =========="
 sysctl net.ipv4.tcp_congestion_control
 sysctl net.core.rmem_max
 sysctl net.netfilter.nf_conntrack_max
+
+echo ""
+echo "🎯 优化完成：BBR + 动态调参 + 高并发已启用"
