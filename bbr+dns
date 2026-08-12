@@ -26,7 +26,7 @@ auto-tune.py — 单文件版 VPS 网络调优工具（不含出口限速功能�
 集成能力：
   1. BBR / 拥塞控制调优（check / enable-bbr）
   2. TCP buffer / conntrack 表 / 常规网络参数调优（tune-sysctl）
-  3. 真实带宽探测（speedtest），优先用 Ookla 官方 CLI，没装则退回内置 Cloudflare 单节点粗测
+  3. 真实带宽探测（speedtest），用 Ookla 官方 CLI 多线程实测，没装会自动安装（需要 root）
   4. 本地 DNS 缓存（dns-cache），基于 unbound，按 CPU/内存自动分配线程数和缓存大小
 
 已移除的功能：不再包含任何 tc / htb 出口带宽限速、AIMD 动态调速、
@@ -36,7 +36,13 @@ auto-tune.py — 单文件版 VPS 网络调优工具（不含出口限速功能�
   - 默认只读、只打印计划，不改配置；任何真正下发变更的动作都需要显式 --apply。
   - 改 sysctl / DNS 前自动备份，可回滚。
   - 单文件、无第三方 Python 依赖，装好 python3 就能跑。
-  - Ookla CLI 是可选增强：没装也能跑，装了会自动优先使用，测速更准。
+  - 测速只用 Ookla 官方 CLI（不再内置 Cloudflare 粗测兜底）；没装会在需要测速时自动安装（需要
+    root 和能访问 packagecloud.io），实在装不上则跳过测速，直接退回网卡自报/历史记录/保守默认值，
+    不会中断整个调优流程。
+  - 先测速、再调优：auto 命令固定顺序是"实测带宽 -> 开 BBR -> 调 sysctl"，
+    buffer 分档用的是测出来的真实数字，而不是虚拟网卡自己虚报的速率。
+  - 交互菜单直接回车 = 执行「全自动调优」这整条链路（测速+装CLI+开BBR+调sysctl），
+    中途不再需要额外确认。
   - dns-cache 默认只允许本机（127.0.0.0/8、::1/128）查询，绝不默认开放给公网——
     开放给 0.0.0.0/0 的递归解析器很容易被当成 DNS 放大攻击的跳板，云厂商也可能因此封号。
     如果确实需要给内网其他机器提供服务，用 --allow-cidr 显式加白名单网段。
@@ -58,7 +64,7 @@ curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPO_NAME
   sudo python3 auto-tune.py enable-bbr --apply
   sudo python3 auto-tune.py tune-sysctl --apply
   sudo python3 auto-tune.py speedtest                       # 测速+识别服务器信息
-  sudo python3 auto-tune.py speedtest --install-ookla        # 先装 Ookla CLI 再测
+  sudo python3 auto-tune.py speedtest                         # 没装 Ookla CLI 会自动先装再测
   sudo python3 auto-tune.py dns-cache --apply                 # 装 unbound，仅本机可用
   sudo python3 auto-tune.py dns-cache --apply --allow-cidr 10.0.0.0/8   # 额外放行内网段
   sudo python3 auto-tune.py auto                              # --link-mbit 不给则自动测速
@@ -415,8 +421,8 @@ def get_ookla_binary():
     return shutil.which("speedtest")
 
 
-def install_ookla_cli():
-    require_root()
+def _do_install_ookla():
+    """实际安装逻辑，不做 root 检查（由调用方决定要不要硬性要求 root）。"""
     if get_ookla_binary():
         logging.info("检测到已安装 Ookla speedtest CLI，跳过安装")
         return True
@@ -441,10 +447,28 @@ def install_ookla_cli():
     return False
 
 
+def install_ookla_cli():
+    """显式安装入口（硬性要求 root，权限不够直接退出）：用于用户主动要求安装的场景。"""
+    require_root()
+    return _do_install_ookla()
+
+
+def ensure_ookla_installed():
+    """自动测速前的静默确保步骤：已装则直接返回 True；没装且是 root 则自动装；
+    不是 root 则只警告一句，不中断整个流程（调用方会因为拿不到 binary 而优雅地报错）。"""
+    if get_ookla_binary():
+        return True
+    if os.geteuid() != 0:
+        logging.warning("未安装 Ookla speedtest CLI，且当前非 root，无法自动安装。请用 sudo 重跑，或手动安装: https://www.speedtest.net/apps/cli")
+        return False
+    logging.info("未检测到 Ookla speedtest CLI，自动安装中 ...")
+    return _do_install_ookla()
+
+
 def list_ookla_servers():
     binary = get_ookla_binary()
     if not binary:
-        logging.error("未安装 Ookla speedtest CLI，无法列出服务器。先运行: speedtest --install-ookla")
+        logging.error("未安装 Ookla speedtest CLI，无法列出服务器（自动安装可能因权限或网络原因失败，可手动运行 speedtest --list-servers 重试，或参考 https://www.speedtest.net/apps/cli 手动安装）")
         return []
     out = run(f"{binary} --servers --accept-license --accept-gdpr -f json 2>/dev/null", check=False, timeout=20)
     try:
@@ -497,62 +521,22 @@ def run_ookla_speedtest(server_id=None, timeout=60):
     }
 
 
-def run_speedtest(download_bytes=30_000_000, upload_bytes=15_000_000, timeout=25):
-    """内置兜底测速：用 Cloudflare 公开的测速接口做一次上传/下载测速，不需要装任何额外工具。"""
-    down_mbit, up_mbit = None, None
-    import time as _time
+def detect_link_speed_via_speedtest(server_id=None, no_install=False):
+    """统一测速入口：只用 Ookla 官方 CLI，没有内置兜底测速。
+    没装且允许自动安装（未加 no_install 且当前是 root）时会先自动装上再测；
+    装不上或测速失败，直接返回 None，交给调用方走下一优先级（网卡自报/历史记录/默认值）。"""
+    if not no_install:
+        ensure_ookla_installed()
 
-    try:
-        t0 = _time.time()
-        out = run(
-            f'curl -o /dev/null -s -w "%{{size_download}}" '
-            f'"https://speed.cloudflare.com/__down?bytes={download_bytes}" '
-            f'--max-time {timeout}',
-            check=False, timeout=timeout + 5,
-        )
-        elapsed = _time.time() - t0
-        downloaded = int((out or "0").strip() or 0)
-        if downloaded > 1_000_000 and elapsed > 0.3:
-            down_mbit = (downloaded * 8) / elapsed / 1_000_000
-    except Exception as e:
-        logging.warning("下载测速失败: %s", e)
-
-    try:
-        t0 = _time.time()
-        out = run(
-            f'head -c {upload_bytes} /dev/urandom | curl -X POST --data-binary @- -s '
-            f'-w "%{{size_upload}}" "https://speed.cloudflare.com/__up" --max-time {timeout}',
-            check=False, timeout=timeout + 5,
-        )
-        elapsed = _time.time() - t0
-        uploaded = int((out or "0").strip() or 0)
-        if uploaded > 1_000_000 and elapsed > 0.3:
-            up_mbit = (uploaded * 8) / elapsed / 1_000_000
-    except Exception as e:
-        logging.warning("上传测速失败: %s", e)
-
-    return down_mbit, up_mbit
-
-
-def detect_link_speed_via_speedtest(server_id=None):
-    ookla = run_ookla_speedtest(server_id=server_id)
-    if ookla and (ookla.get("down_mbit") or ookla.get("up_mbit")):
-        return ookla
-
-    if get_ookla_binary():
-        logging.warning("Ookla CLI 已安装但本次测速失败，退回内置 Cloudflare 粗测")
-    else:
-        logging.info("未安装 Ookla CLI，使用内置 Cloudflare 粗测（更准确的测速可运行: speedtest --install-ookla）")
-
-    down_mbit, up_mbit = run_speedtest()
-    if down_mbit is None and up_mbit is None:
+    if not get_ookla_binary():
+        logging.warning("Ookla speedtest CLI 不可用，跳过实测这一步")
         return None
-    return {
-        "down_mbit": down_mbit, "up_mbit": up_mbit,
-        "ping_ms": None, "jitter_ms": None,
-        "server_name": "Cloudflare (内置粗测)", "server_location": None,
-        "isp": None, "result_url": None,
-    }
+
+    r = run_ookla_speedtest(server_id=server_id)
+    if r and (r.get("down_mbit") or r.get("up_mbit")):
+        return r
+    logging.warning("Ookla CLI 测速未取得有效结果")
+    return None
 
 
 def print_speedtest_result(r):
@@ -577,8 +561,9 @@ def print_speedtest_result(r):
 
 
 def cmd_speedtest(args):
-    if args.install_ookla:
-        install_ookla_cli()
+    if not args.no_install_ookla:
+        ensure_ookla_installed()
+
     if args.list_servers:
         servers = list_ookla_servers()
         if isinstance(servers, list) and servers:
@@ -591,7 +576,7 @@ def cmd_speedtest(args):
             print("未能列出服务器（可能未安装 Ookla CLI，或网络无法访问 speedtest.net）")
         return
 
-    r = detect_link_speed_via_speedtest(server_id=args.server_id)
+    r = detect_link_speed_via_speedtest(server_id=args.server_id, no_install=args.no_install_ookla)
     print_speedtest_result(r)
 
 
@@ -823,16 +808,13 @@ def install_self():
 # --------------------------------------------------------------------------
 
 def cmd_auto(args):
-    """全自动：探测网卡/带宽/并发连接数 -> 开 BBR -> 调 sysctl（TCP buffer / conntrack）。
+    """全自动：先测速、再调优 —— 实测带宽(自动装 Ookla CLI) -> 开 BBR -> 调 sysctl（TCP buffer / conntrack）。
     默认不含 DNS 缓存（DNS 会改 resolv.conf、停用 systemd-resolved，影响面较大，需要显式 --with-dns-cache 才会做）。
     也不做任何出口限速相关的操作。
     """
     require_root()
 
-    logging.info("===== 全自动调优模式：探测 -> 开 BBR -> 调 sysctl（不含限速） =====")
-
-    if args.install_ookla:
-        install_ookla_cli()
+    logging.info("===== 全自动调优模式：先测速、再调优（不含限速） =====")
 
     iface = args.iface or detect_default_iface()
     if not iface:
@@ -842,14 +824,20 @@ def cmd_auto(args):
     speedtest_unsafe = established is not None and established >= 500
 
     last_known = read_last_known_speed()
-    speed_mbit = args.link_mbit or (detect_link_speed_mbit(iface) if iface else None)
-    trust_this_value = bool(speed_mbit)
+    speed_mbit = None
+    trust_this_value = False
     speedtest_detail = None
 
-    if speed_mbit:
-        logging.info("探测到链路速率: %smbit", speed_mbit)
+    # 带宽探测优先级：手动指定 > 实测测速(Ookla，真实带宽) > 网卡自报(ethtool/sysfs，
+    # 虚拟网卡常见虚报) > 历史记录 > 保守默认值。
+    # 先测速再调优：这里在开 BBR / 调 sysctl 之前就把这一步做完，后面的 buffer 分档
+    # 才是基于真实测出来的数字，而不是网卡自己吹的数字。
+    if args.link_mbit:
+        speed_mbit = args.link_mbit
+        trust_this_value = True
+        logging.info("使用手动指定的链路速率: %smbit", speed_mbit)
     elif args.no_speedtest:
-        pass
+        logging.info("已加 --no-speedtest，跳过实测，改用网卡自报速率")
     elif speedtest_unsafe and not args.force_speedtest:
         logging.warning(
             "当前有 %d 个建立态连接，属于高并发机器——这个时候测速大概率会被真实流量"
@@ -858,7 +846,7 @@ def cmd_auto(args):
             established,
         )
     else:
-        logging.info("网卡没有上报真实速率（虚拟网卡常见），尝试实测一次（优先用 Ookla CLI，没装则用内置粗测）...")
+        logging.info("第一步：先测速再调优，用 Ookla CLI 实测真实带宽 ...")
         r = detect_link_speed_via_speedtest(server_id=args.server_id)
         speedtest_detail = r
         up_mbit = r.get("up_mbit") if r else None
@@ -882,7 +870,14 @@ def cmd_auto(args):
                 speed_mbit = candidate
                 trust_this_value = True
         else:
-            logging.warning("实测也失败了（可能是这台机器出不了公网，或者被墙，或 Ookla CLI 无法访问 speedtest.net）")
+            logging.warning("实测未能完成（可能是这台机器出不了公网、被墙，或没有 root 权限自动安装 Ookla CLI）")
+
+    if not speed_mbit and iface:
+        eth_speed = detect_link_speed_mbit(iface)
+        if eth_speed:
+            speed_mbit = eth_speed
+            trust_this_value = True
+            logging.info("退回网卡自报速率: %smbit（虚拟网卡上这个数字可能不准）", speed_mbit)
 
     if not speed_mbit and last_known:
         speed_mbit = int(last_known)
@@ -897,6 +892,7 @@ def cmd_auto(args):
     if trust_this_value:
         write_last_known_speed(speed_mbit)
 
+    logging.info("第二步：开始调优 —— 开 BBR + 调 sysctl（基于上面测出的 %smbit）", speed_mbit)
     do_enable_bbr(apply=True)
 
     if not args.no_sysctl_tune:
@@ -912,18 +908,22 @@ def cmd_auto(args):
 
     install_self()
 
-    speed_source = (
-        ("实测（%s）" % speedtest_detail.get("server_name")) if speedtest_detail and speedtest_detail.get("server_name")
-        else ("手动指定" if args.link_mbit else ("网卡自报" if trust_this_value and not speedtest_detail else "历史记录/保守默认值"))
-    )
+    if args.link_mbit:
+        speed_source = "手动指定"
+    elif speedtest_detail and speedtest_detail.get("up_mbit"):
+        speed_source = "实测（%s）" % (speedtest_detail.get("server_name") or "Ookla")
+    elif trust_this_value:
+        speed_source = "网卡自报/历史记录"
+    else:
+        speed_source = "保守默认值"
 
     print(f"""
 ======================================================================
-全自动调优完成（BBR + sysctl{' + DNS缓存' if args.with_dns_cache else ''}，不含限速）。
+全自动调优完成（先测速、再调优：BBR + sysctl{' + DNS缓存' if args.with_dns_cache else ''}，不含限速）。
 
 带宽依据    : {speed_mbit}mbit（来源: {speed_source}，仅用于 TCP buffer 分档）
 查看当前状态: python3 {os.path.join(INSTALL_DIR, "auto-tune.py")} check
-如需更准确的带宽数字：{os.path.join(INSTALL_DIR, "auto-tune.py")} auto --install-ookla --force-speedtest
+如需强制重新实测：{os.path.join(INSTALL_DIR, "auto-tune.py")} auto --force-speedtest
 ======================================================================
 """)
 
@@ -959,18 +959,18 @@ def run_menu():
         choice = raw.strip() or "1"
 
     if choice == "1":
+        # 回车默认走这条：探测带宽(自动装 Ookla CLI 并先测速) -> 开 BBR -> 调 sysctl，
+        # 一次性跑完整个链路，中途不再需要任何交互。
         cmd_auto(argparse.Namespace(
             iface=None, link_mbit=None,
             no_speedtest=False, force_speedtest=False, no_sysctl_tune=False,
-            install_ookla=False, server_id=None,
+            no_install_ookla=False, server_id=None,
             with_dns_cache=False, allow_cidr=None, no_disable_systemd_resolved=False,
         ))
     elif choice == "2":
         cmd_check(argparse.Namespace())
     elif choice == "3":
-        install_choice = read_tty_line("是否先安装 Ookla 官方测速 CLI？未安装则回车跳过，y 安装: ")
-        do_install = bool(install_choice) and install_choice.strip().lower() == "y"
-        cmd_speedtest(argparse.Namespace(install_ookla=do_install, list_servers=False, server_id=None))
+        cmd_speedtest(argparse.Namespace(no_install_ookla=False, list_servers=False, server_id=None))
     elif choice == "4":
         logging.info("默认只允许本机查询（127.0.0.1），不对公网开放。如需给内网其他机器用，用命令行 --allow-cidr 指定网段。")
         cmd_dns_cache(argparse.Namespace(
@@ -1002,18 +1002,19 @@ def main():
     p_sysctl.add_argument("--apply", action="store_true", help="真正写入并生效；不加则只打印计划")
     p_sysctl.set_defaults(func=cmd_tune_sysctl)
 
-    p_auto = sub.add_parser("auto", help="全自动：探测网卡/带宽、开 BBR、调 sysctl，一步到位（不含限速）")
-    p_auto.add_argument("--iface", help="手动指定网卡，不给则自动探测默认路由网卡")
+    p_auto = sub.add_parser("auto", help="全自动：先测速、再调优 —— 探测带宽 -> 开 BBR -> 调 sysctl，一步到位（不含限速）")
+    p_auto.add_argument("--iface", help="手动指定网卡，仅在需要网卡自报速率兜底时用，不给则自动探测默认路由网卡")
     p_auto.add_argument("--link-mbit", dest="link_mbit", type=int,
-                         help="手动指定链路速率(Mbit)，仅用于 TCP buffer 分档，不给则尝试自动探测")
+                         help="手动指定链路速率(Mbit)，仅用于 TCP buffer 分档，指定后跳过测速直接使用这个值")
     p_auto.add_argument("--no-speedtest", dest="no_speedtest", action="store_true",
-                         help="网卡探测不到真实速率时，不要额外做一次实测（默认会做）")
+                         help="不做实测，直接用网卡自报速率/历史记录/默认值（默认会优先实测）")
     p_auto.add_argument("--force-speedtest", dest="force_speedtest", action="store_true",
                          help="即使这次实测结果比历史记录低很多，也强制采信这次实测")
     p_auto.add_argument("--no-sysctl-tune", dest="no_sysctl_tune", action="store_true",
                          help="不要自动调 TCP buffer/conntrack 表大小等常规 sysctl 参数（默认会调）")
-    p_auto.add_argument("--install-ookla", dest="install_ookla", action="store_true",
-                         help="测速前先自动安装官方 Ookla speedtest CLI（更准确，需要能访问 packagecloud.io）")
+    p_auto.add_argument("--no-install-ookla", dest="no_install_ookla", action="store_true",
+                         help="测速时不要自动安装 Ookla CLI（默认没装会自动装，需要 root 且能访问 packagecloud.io）；"
+                              "加了这个之后如果没装 Ookla CLI，会直接跳过实测走网卡自报/历史记录")
     p_auto.add_argument("--server-id", dest="server_id",
                          help="指定 Ookla 测速服务器 ID，不给则用延迟最低的自动最优节点")
     p_auto.add_argument("--with-dns-cache", dest="with_dns_cache", action="store_true",
@@ -1026,11 +1027,11 @@ def main():
                               "只安装配置 unbound 本身（适合你想自己手动接管切换的场景）")
     p_auto.set_defaults(func=cmd_auto)
 
-    p_speedtest = sub.add_parser("speedtest", help="测一次真实上传/下载速度并识别测速服务器信息（优先用 Ookla 官方 CLI）")
-    p_speedtest.add_argument("--install-ookla", dest="install_ookla", action="store_true",
-                              help="测速前先自动安装官方 Ookla CLI（apt/yum 均支持，需要能访问 packagecloud.io）")
+    p_speedtest = sub.add_parser("speedtest", help="用 Ookla 官方 CLI 测一次真实上传/下载速度并识别测速服务器信息")
+    p_speedtest.add_argument("--no-install-ookla", dest="no_install_ookla", action="store_true",
+                              help="没装 Ookla CLI 时不要自动安装（默认没装会自动装，需要 root 权限）")
     p_speedtest.add_argument("--list-servers", dest="list_servers", action="store_true",
-                              help="只列出附近可用的测速服务器（id/名称/位置），不测速；需要已安装 Ookla CLI")
+                              help="只列出附近可用的测速服务器（id/名称/位置），不测速；没装 Ookla CLI 会先自动装")
     p_speedtest.add_argument("--server-id", dest="server_id",
                               help="指定测速服务器 ID（配合 --list-servers 查到的 id 使用），不给则自动选最优节点")
     p_speedtest.set_defaults(func=cmd_speedtest)
