@@ -821,7 +821,6 @@ def cmd_auto(args):
         logging.warning("自动探测网卡失败，跳过网卡自报速率探测，可用 --iface 指定或 --link-mbit 手动指定带宽")
 
     established = detect_established_connections()
-    speedtest_unsafe = established is not None and established >= 500
 
     last_known = read_last_known_speed()
     speed_mbit = None
@@ -832,19 +831,14 @@ def cmd_auto(args):
     # 虚拟网卡常见虚报) > 历史记录 > 保守默认值。
     # 先测速再调优：这里在开 BBR / 调 sysctl 之前就把这一步做完，后面的 buffer 分档
     # 才是基于真实测出来的数字，而不是网卡自己吹的数字。
+    # 注意：不管当前并发连接数多高，都会照常实测，不做"高并发时跳过测速"的判断——
+    # 如果你的机器本身流量很大、担心测速结果被干扰，测完自己核对一下数字是否合理即可。
     if args.link_mbit:
         speed_mbit = args.link_mbit
         trust_this_value = True
         logging.info("使用手动指定的链路速率: %smbit", speed_mbit)
     elif args.no_speedtest:
         logging.info("已加 --no-speedtest，跳过实测，改用网卡自报速率")
-    elif speedtest_unsafe and not args.force_speedtest:
-        logging.warning(
-            "当前有 %d 个建立态连接，属于高并发机器——这个时候测速大概率会被真实流量"
-            "抢占带宽/CPU，测出的数字不可信，直接跳过这次测速（不采信任何测速结果）。"
-            "如果你确认现在适合测，可以加 --force-speedtest 强制测。",
-            established,
-        )
     else:
         logging.info("第一步：先测速再调优，用 Ookla CLI 实测真实带宽 ...")
         r = detect_link_speed_via_speedtest(server_id=args.server_id)
@@ -858,17 +852,8 @@ def cmd_auto(args):
                 "实测完成（节点: %s）: 上传≈%.1fmbit 下载≈%.1fmbit",
                 src, up_mbit, down_mbit or 0,
             )
-            if last_known and candidate < last_known * 0.5 and not args.force_speedtest:
-                logging.warning(
-                    "这次实测(%.0fmbit)比上次记录(%.0fmbit)低了一半以上，很可能是测速时机不好，"
-                    "本次沿用历史记录，不采信这次实测结果。如果你确认带宽确实下降了，加 --force-speedtest 强制采信。",
-                    candidate, last_known,
-                )
-                speed_mbit = int(last_known)
-                trust_this_value = True
-            else:
-                speed_mbit = candidate
-                trust_this_value = True
+            speed_mbit = candidate
+            trust_this_value = True
         else:
             logging.warning("实测未能完成（可能是这台机器出不了公网、被墙，或没有 root 权限自动安装 Ookla CLI）")
 
@@ -923,7 +908,7 @@ def cmd_auto(args):
 
 带宽依据    : {speed_mbit}mbit（来源: {speed_source}，仅用于 TCP buffer 分档）
 查看当前状态: python3 {os.path.join(INSTALL_DIR, "auto-tune.py")} check
-如需强制重新实测：{os.path.join(INSTALL_DIR, "auto-tune.py")} auto --force-speedtest
+如需重新实测：{os.path.join(INSTALL_DIR, "auto-tune.py")} auto
 ======================================================================
 """)
 
@@ -963,7 +948,7 @@ def run_menu():
         # 一次性跑完整个链路，中途不再需要任何交互。
         cmd_auto(argparse.Namespace(
             iface=None, link_mbit=None,
-            no_speedtest=False, force_speedtest=False, no_sysctl_tune=False,
+            no_speedtest=False, no_sysctl_tune=False,
             no_install_ookla=False, server_id=None,
             with_dns_cache=False, allow_cidr=None, no_disable_systemd_resolved=False,
         ))
@@ -1008,8 +993,6 @@ def main():
                          help="手动指定链路速率(Mbit)，仅用于 TCP buffer 分档，指定后跳过测速直接使用这个值")
     p_auto.add_argument("--no-speedtest", dest="no_speedtest", action="store_true",
                          help="不做实测，直接用网卡自报速率/历史记录/默认值（默认会优先实测）")
-    p_auto.add_argument("--force-speedtest", dest="force_speedtest", action="store_true",
-                         help="即使这次实测结果比历史记录低很多，也强制采信这次实测")
     p_auto.add_argument("--no-sysctl-tune", dest="no_sysctl_tune", action="store_true",
                          help="不要自动调 TCP buffer/conntrack 表大小等常规 sysctl 参数（默认会调）")
     p_auto.add_argument("--no-install-ookla", dest="no_install_ookla", action="store_true",
