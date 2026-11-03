@@ -570,20 +570,46 @@ def list_ookla_servers():
         return text
 
 
-def run_ookla_speedtest(server_id=None, timeout=60):
+def run_ookla_speedtest(server_id=None, timeout=120):
+    """运行 Ookla CLI。保留 stderr/退出码用于诊断，并兼容 JSON 与人类可读输出。"""
     binary = get_ookla_binary()
     if not binary:
+        logging.error("找不到 speedtest 可执行文件")
         return None
 
-    server_arg = f"--server-id={server_id}" if server_id else ""
-    cmd = f"{binary} {server_arg} --accept-license --accept-gdpr -f json 2>/dev/null"
-    logging.info("使用 Ookla CLI 测速中（多线程，通常耗时 10~30 秒）...")
-    out = run(cmd, check=False, timeout=timeout)
-    try:
-        data = json.loads(out)
-    except (json.JSONDecodeError, TypeError):
-        logging.warning("Ookla CLI 输出解析失败，原始输出: %s", (out or "")[:300])
-        return None
+    logging.info("测速程序: %s", binary)
+    server_args = [f"--server-id={server_id}"] if server_id else []
+    base_args = ["--accept-license", "--accept-gdpr"]
+    attempts = [
+        base_args + server_args + ["--format=json"],
+        base_args + server_args + ["-f", "json"],
+    ]
+
+    data = None
+    for idx, args in enumerate(attempts, 1):
+        cmd = [binary] + args
+        logging.info("开始 Ookla 实测（第 %s 次尝试，最长 %ss）...", idx, timeout)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            logging.warning("Ookla 测速超时（%ss）", timeout)
+            continue
+        except OSError as e:
+            logging.error("无法启动测速程序 %s: %s", binary, e)
+            return None
+
+        stdout = (proc.stdout or "").strip()
+        stderr = (proc.stderr or "").strip()
+        if proc.returncode != 0:
+            logging.warning("Ookla 退出码=%s，错误信息: %s", proc.returncode, (stderr or stdout or "(无输出)")[:500])
+        if stdout:
+            try:
+                data = json.loads(stdout)
+                break
+            except json.JSONDecodeError:
+                # 有些发行版装到同名的 speedtest-cli，输出不是 Ookla JSON。
+                pass
+        logging.warning("本次未得到 JSON 结果；stdout=%r stderr=%r", stdout[:250], stderr[:350])
 
     def bandwidth_to_mbit(bw):
         if bw is None:
@@ -593,23 +619,52 @@ def run_ookla_speedtest(server_id=None, timeout=60):
         except (TypeError, ValueError):
             return None
 
-    down = data.get("download", {})
-    up = data.get("upload", {})
-    ping = data.get("ping", {})
-    server = data.get("server", {})
-    result = data.get("result", {})
+    if isinstance(data, dict):
+        down = data.get("download") or {}
+        up = data.get("upload") or {}
+        ping = data.get("ping") or {}
+        server = data.get("server") or {}
+        result = data.get("result") or {}
+        down_mbit = bandwidth_to_mbit(down.get("bandwidth"))
+        up_mbit = bandwidth_to_mbit(up.get("bandwidth"))
+        if down_mbit or up_mbit:
+            return {
+                "down_mbit": down_mbit,
+                "up_mbit": up_mbit,
+                "ping_ms": ping.get("latency"),
+                "jitter_ms": ping.get("jitter"),
+                "server_name": server.get("name"),
+                "server_location": f"{server.get('location', '')} ({server.get('country', '')})".strip(),
+                "server_host": server.get("host"),
+                "isp": data.get("isp"),
+                "result_url": result.get("url"),
+            }
+        logging.warning("Ookla JSON 中没有有效的 download/upload.bandwidth 字段: %s", str(data)[:500])
 
-    return {
-        "down_mbit": bandwidth_to_mbit(down.get("bandwidth")),
-        "up_mbit": bandwidth_to_mbit(up.get("bandwidth")),
-        "ping_ms": ping.get("latency"),
-        "jitter_ms": ping.get("jitter"),
-        "server_name": server.get("name"),
-        "server_location": f"{server.get('location', '')} ({server.get('country', '')})".strip(),
-        "server_host": server.get("host"),
-        "isp": data.get("isp"),
-        "result_url": result.get("url"),
-    }
+    # 兼容 python speedtest-cli / 其他 speedtest 同名程序的文本输出。
+    try:
+        proc = subprocess.run([binary] + server_args, capture_output=True, text=True, timeout=timeout)
+        output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        md = re.search(r"Download\s*:\s*([0-9.]+)\s*([KMG])?(?:bit/s|bps)", output, re.I)
+        mu = re.search(r"Upload\s*:\s*([0-9.]+)\s*([KMG])?(?:bit/s|bps)", output, re.I)
+        def text_mbit(m):
+            if not m:
+                return None
+            v = float(m.group(1))
+            unit = (m.group(2) or "M").upper()
+            return v / 1000 if unit == "K" else (v * 1000 if unit == "G" else v)
+        down_mbit, up_mbit = text_mbit(md), text_mbit(mu)
+        if down_mbit or up_mbit:
+            logging.info("已从文本测速结果解析到速度")
+            return {"down_mbit": down_mbit, "up_mbit": up_mbit, "ping_ms": None,
+                    "jitter_ms": None, "server_name": "文本测速结果", "server_location": "",
+                    "server_host": None, "isp": None, "result_url": None}
+        logging.error("测速程序没有返回可识别的速度。最后输出: %s", output.strip()[:600] or "(stdout/stderr 均为空)")
+    except subprocess.TimeoutExpired:
+        logging.error("文本格式测速也超时")
+    except OSError as e:
+        logging.error("文本格式测速启动失败: %s", e)
+    return None
 
 
 def detect_link_speed_via_speedtest(server_id=None, no_install=False):
@@ -948,22 +1003,23 @@ def cmd_auto(args):
         else:
             logging.warning("实测未能完成（可能是这台机器出不了公网、被墙，或没有 root 权限自动安装 Ookla CLI）")
 
-    if not speed_mbit and iface:
-        eth_speed = detect_link_speed_mbit(iface)
-        if eth_speed:
-            speed_mbit = eth_speed
+    # 正常全自动模式必须拿到本次真实测速结果；不再把网卡标称速率、旧记录或 1000M
+    # 冒充本次实测值。只有用户显式传入 --no-speedtest 时，才允许使用历史/网卡兜底。
+    if not speed_mbit and args.no_speedtest:
+        if iface:
+            eth_speed = detect_link_speed_mbit(iface)
+            if eth_speed:
+                speed_mbit = eth_speed
+                trust_this_value = True
+                logging.warning("用户显式跳过测速，使用网卡自报速率 %smbit（虚拟网卡可能虚报）", speed_mbit)
+        if not speed_mbit and last_known:
+            speed_mbit = int(last_known)
             trust_this_value = True
-            logging.info("退回网卡自报速率: %smbit（虚拟网卡上这个数字可能不准）", speed_mbit)
-
-    if not speed_mbit and last_known:
-        speed_mbit = int(last_known)
-        trust_this_value = True
-        logging.warning("这次没能探测到任何真实速率，沿用上次记录的 %smbit", speed_mbit)
+            logging.warning("用户显式跳过测速，沿用历史速率 %smbit", speed_mbit)
 
     if not speed_mbit:
-        speed_mbit = 1000
-        trust_this_value = False
-        logging.warning("最终没能测出真实速率，使用保守默认值 %smbit（仅影响 TCP buffer 分档，本版本不限速）。", speed_mbit)
+        logging.error("真实测速失败：为避免使用虚假带宽参数，本次停止自动调优，没有写入新的 sysctl 参数。请检查 speedtest 输出/网络，或手动指定 --link-mbit。")
+        return
 
     if trust_this_value:
         write_last_known_speed(speed_mbit)
