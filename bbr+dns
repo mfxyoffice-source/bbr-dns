@@ -4,18 +4,99 @@
 # 用法：
 #   bash <(curl -Ls https://raw.githubusercontent.com/mfxyoffice-source/auto-tune/main/auto-tune.sh)
 #
-set -euo pipefail
+set -Eeuo pipefail
 INSTALL_DIR="/opt/auto-tune"
 CONFIG_DIR="/etc/auto-tune"
 PY_PATH="$INSTALL_DIR/auto-tune.py"
+
 if [[ "$(id -u)" -ne 0 ]]; then
-    echo "请用 root 权限运行" >&2
+    echo "请用 root 权限运行：sudo bash auto-tune.sh" >&2
     exit 1
 fi
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "未找到 python3，请先安装后重试" >&2
-    exit 1
+
+# 环境准备：只安装真正需要的基础工具；本脚本不使用 pip，也不安装 python3-pip。
+# 不安装/重启 openssh-server，避免影响当前 SSH 连接。
+install_python3() {
+    command -v python3 >/dev/null 2>&1 && return 0
+    echo "[环境] 未发现 Python3，尝试通过系统包管理器安装..."
+    if command -v apt-get >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update || true
+        apt-get install -y python3 curl wget ca-certificates || true
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y python3 curl wget ca-certificates || true
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y python3 curl wget ca-certificates || true
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache python3 curl wget ca-certificates || true
+    elif command -v zypper >/dev/null 2>&1; then
+        zypper --non-interactive refresh || true
+        zypper --non-interactive install python3 curl wget ca-certificates || true
+    else
+        echo "[环境] 未识别包管理器，跳过自动安装。"
+    fi
+    command -v python3 >/dev/null 2>&1
+}
+
+# 无 Python3 且软件源也不可达时，仍可用纯 Bash 完成核心 BBR/sysctl 调优。
+shell_fallback_tune() {
+    echo "=============================================================="
+    echo "Python3 不可用，进入纯 Bash 兼容模式（不测速、不配置 DNS 缓存）"
+    echo "=============================================================="
+    mkdir -p "$CONFIG_DIR" /etc/sysctl.d /etc/modules-load.d
+    local cc="" avail=""
+    if command -v sysctl >/dev/null 2>&1; then
+        avail="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+        if ! grep -qw bbr <<< "$avail"; then
+            modprobe tcp_bbr 2>/dev/null || true
+            avail="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+        fi
+        if grep -qw bbr <<< "$avail"; then
+            cat > /etc/sysctl.d/99-auto-tune.conf <<'BBR_EOF'
+# auto-tune fallback: BBR
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+BBR_EOF
+            echo tcp_bbr > /etc/modules-load.d/auto-tune-tcp-bbr.conf
+            sysctl --system >/dev/null 2>&1 || true
+            cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+            echo "[BBR] 当前拥塞控制：${cc:-读取失败}"
+        else
+            echo "[BBR] 当前内核未发现 BBR 支持，跳过；不自动更换内核。"
+        fi
+        cat > /etc/sysctl.d/98-auto-tune-extra.conf <<'SYSCTL_EOF'
+# auto-tune fallback: conservative TCP tuning
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 87380 16777216
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.ip_local_port_range = 1024 65535
+net.core.somaxconn = 65535
+net.netfilter.nf_conntrack_max = 262144
+SYSCTL_EOF
+        modprobe nf_conntrack 2>/dev/null || true
+        echo nf_conntrack > /etc/modules-load.d/auto-tune-nf-conntrack.conf
+        sysctl --system >/dev/null 2>&1 || true
+        echo "[SYSCTL] 已写入保守参数并尝试生效。"
+    else
+        echo "[错误] 找不到 sysctl，无法执行内核网络调优。"
+        return 1
+    fi
+    echo "[提示] 纯 Bash 模式未执行 Ookla 测速和 unbound DNS 缓存配置。"
+    echo "[提示] 没有重启网络、SSH 或现有业务服务。"
+    echo "完成。"
+}
+
+if ! install_python3; then
+    shell_fallback_tune
+    exit $?
 fi
+
 mkdir -p "$INSTALL_DIR" "$CONFIG_DIR"
 cat > "$PY_PATH" <<'PYEOF'
 #!/usr/bin/env python3
@@ -35,8 +116,9 @@ auto-tune.py — 单文件版 VPS 网络调优工具（不含出口限速功能�
 设计原则：
   - 默认只读、只打印计划，不改配置；任何真正下发变更的动作都需要显式 --apply。
   - 改 sysctl / DNS 前自动备份，可回滚。
-  - 单文件、无第三方 Python 依赖，装好 python3 就能跑。
-  - 测速只用 Ookla 官方 CLI（不再内置 Cloudflare 粗测兜底）；没装会在需要测速时自动安装（需要
+  - 单文件、仅使用 Python 标准库，不需要 pip / PyPI / 第三方 Python 包。
+  - 启动时自动尝试安装 Python3；若 Python3 和系统软件源都不可用，则退回纯 Bash 核心调优模式。
+  - 测速只用 Ookla 官方 CLI；没装会在需要测速时尝试安装（需要
     root 和能访问 packagecloud.io），实在装不上则跳过测速，直接退回网卡自报/历史记录/保守默认值，
     不会中断整个调优流程。
   - 先测速、再调优：auto 命令固定顺序是"实测带宽 -> 开 BBR -> 调 sysctl"，
@@ -148,6 +230,10 @@ def detect_pkg_manager():
         return "dnf"
     if shutil.which("yum"):
         return "yum"
+    if shutil.which("apk"):
+        return "apk"
+    if shutil.which("zypper"):
+        return "zypper"
     return None
 
 
@@ -155,17 +241,23 @@ def install_packages(pkgs):
     """按发行版用对应包管理器安装一批包，返回是否成功（不中断整个流程，失败会记录日志）。"""
     mgr = detect_pkg_manager()
     if mgr == "apt":
-        run("apt-get update -y", check=False, timeout=120)
-        out_ok = subprocess.run(
-            f"apt-get install -y {' '.join(pkgs)}", shell=True, timeout=180
-        ).returncode == 0
+        # apt-get update 不需要 -y；更新失败不阻断尝试使用本地索引安装。
+        run("apt-get update", check=False, timeout=120)
+        install_cmd = f"apt-get install -y {' '.join(pkgs)}"
     elif mgr in ("dnf", "yum"):
-        out_ok = subprocess.run(
-            f"{mgr} install -y {' '.join(pkgs)}", shell=True, timeout=180
-        ).returncode == 0
+        install_cmd = f"{mgr} install -y {' '.join(pkgs)}"
+    elif mgr == "apk":
+        install_cmd = f"apk add --no-cache {' '.join(pkgs)}"
+    elif mgr == "zypper":
+        install_cmd = f"zypper --non-interactive install {' '.join(pkgs)}"
     else:
-        logging.error("未识别到 apt/yum/dnf，无法自动安装 %s，请手动安装", pkgs)
+        logging.error("未识别到 apt/dnf/yum/apk/zypper，无法自动安装 %s，请手动安装", pkgs)
         return False
+    try:
+        out_ok = subprocess.run(install_cmd, shell=True, timeout=240).returncode == 0
+    except (subprocess.TimeoutExpired, OSError) as e:
+        logging.error("安装命令执行失败: %s", e)
+        out_ok = False
     if not out_ok:
         logging.error("安装 %s 失败，请检查网络或包名是否适配你的发行版", pkgs)
     return out_ok
