@@ -578,12 +578,24 @@ def run_ookla_speedtest(server_id=None, timeout=120):
         return None
 
     logging.info("测速程序: %s", binary)
-    server_args = [f"--server-id={server_id}"] if server_id else []
-    base_args = ["--accept-license", "--accept-gdpr"]
-    attempts = [
-        base_args + server_args + ["--format=json"],
-        base_args + server_args + ["-f", "json"],
-    ]
+    # 识别同名的两类程序：Ookla 官方 CLI 与 Python speedtest-cli。
+    try:
+        help_proc = subprocess.run([binary, "--help"], capture_output=True, text=True, timeout=10)
+        help_text = (help_proc.stdout or "") + (help_proc.stderr or "")
+    except Exception:
+        help_text = ""
+    is_python_cli = "--json" in help_text and "--format" not in help_text
+    if is_python_cli:
+        logging.info("识别到 Python speedtest-cli，使用 --json 参数测速")
+        server_args = ["--server", str(server_id)] if server_id else []
+        attempts = [server_args + ["--json"]]
+    else:
+        server_args = [f"--server-id={server_id}"] if server_id else []
+        base_args = ["--accept-license", "--accept-gdpr"]
+        attempts = [
+            base_args + server_args + ["--format=json"],
+            base_args + server_args + ["-f", "json"],
+        ]
 
     data = None
     for idx, args in enumerate(attempts, 1):
@@ -623,6 +635,22 @@ def run_ookla_speedtest(server_id=None, timeout=120):
         down = data.get("download") or {}
         up = data.get("upload") or {}
         ping = data.get("ping") or {}
+        # Python speedtest-cli 的 JSON 顶层 download/upload 单位是 bit/s；
+        # Ookla CLI 则是 download.bandwidth/upload.bandwidth，单位为 byte/s。
+        if isinstance(down, (int, float)) and isinstance(up, (int, float)):
+            down_mbit = float(down) / 1_000_000
+            up_mbit = float(up) / 1_000_000
+            server = data.get("server") or {}
+            logging.info("Python speedtest-cli JSON 解析成功：上传 %.2f Mbit/s，下载 %.2f Mbit/s", up_mbit, down_mbit)
+            return {
+                "down_mbit": down_mbit, "up_mbit": up_mbit,
+                "ping_ms": ping.get("latency") if isinstance(ping, dict) else ping,
+                "jitter_ms": None,
+                "server_name": server.get("sponsor") or server.get("name"),
+                "server_location": f"{server.get('name', '')} ({server.get('country', '')})".strip(),
+                "server_host": server.get("host"), "isp": data.get("client", {}).get("isp") if isinstance(data.get("client"), dict) else None,
+                "result_url": data.get("share"),
+            }
         server = data.get("server") or {}
         result = data.get("result") or {}
         down_mbit = bandwidth_to_mbit(down.get("bandwidth"))
@@ -643,7 +671,8 @@ def run_ookla_speedtest(server_id=None, timeout=120):
 
     # 兼容 python speedtest-cli / 其他 speedtest 同名程序的文本输出。
     try:
-        proc = subprocess.run([binary] + server_args, capture_output=True, text=True, timeout=timeout)
+        text_args = server_args if is_python_cli else server_args
+        proc = subprocess.run([binary] + text_args, capture_output=True, text=True, timeout=timeout)
         output = (proc.stdout or "") + "\n" + (proc.stderr or "")
         md = re.search(r"Download\s*:\s*([0-9.]+)\s*([KMG])?(?:bit/s|bps)", output, re.I)
         mu = re.search(r"Upload\s*:\s*([0-9.]+)\s*([KMG])?(?:bit/s|bps)", output, re.I)
